@@ -1,0 +1,109 @@
+.\" SPDX-License-Identifier: MIT
+.\" Copyright (c) 2026 Stephen Olesen
+.TH I2CKISS 8 "August 2026" "i2ckiss-ng 2.0.0" "System Administration"
+.SH NAME
+i2ckiss \- bridge a TNC-Pi I2C endpoint to a KISS pseudo-terminal
+.SH SYNOPSIS
+.B i2ckiss
+.RI [ options ]
+.I i2cbus i2cdevice
+.B symlink
+.I linkname
+.br
+.B i2ckiss
+.RI [ options ]
+.I i2cbus i2cdevice port inetaddr
+.SH DESCRIPTION
+.B i2ckiss
+connects a TNC-Pi or TNC-Black I2C interface to a newly allocated KISS
+pseudo-terminal. In symlink mode it publishes the PTY at
+.IR linkname .
+In AX.25 mode it starts and supervises
+.BR kissattach (8)
+using
+.I port
+and
+.IR inetaddr .
+.SH OPTIONS
+.TP
+.BR \-p " " N , " " \-\-poll-ticks " " N
+Poll every
+.I N
+times 100 milliseconds. The default is 1.
+.TP
+.BI \-\-poll-ms " N"
+Set the polling interval directly in milliseconds.
+.TP
+.BR \-m " " N , " " \-\-mtu " " N
+Pass MTU
+.I N
+to
+.BR kissattach (8).
+.TP
+.BR \-d , " " \-\-debug
+Increase diagnostic output. May be repeated.
+.TP
+.BR \-l , " " \-\-syslog
+Write messages through syslog.
+.TP
+.BR \-D , " " \-\-daemon
+Detach from the terminal. Foreground operation is the default.
+.TP
+.BR \-f , " " \-\-foreground
+Remain in the foreground.
+.TP
+.B \-\-no-reset
+Skip the reset sequence after connecting or reconnecting.
+.TP
+.BI \-\-retry-min-ms " N"
+Set the initial I2C reconnect delay. The default is 250 ms.
+.TP
+.BI \-\-retry-max-ms " N"
+Set the maximum I2C reconnect delay. The default is 30000 ms.
+.TP
+.BI \-\-byte-delay-us " N"
+Set the delay between transmitted I2C bytes. The default is 1000 microseconds.
+.TP
+.BI \-\-reset-delay-ms " N"
+Set the delay after a TNC reset. The default is 2000 ms.
+.TP
+.BI \-\-lock-dir " PATH"
+Store per-bus/address instance locks under
+.IR PATH .
+The default is
+.IR /run/lock .
+.TP
+.BR \-v , " " \-\-version
+Print the version and exit.
+.TP
+.BR \-h , " " \-\-help
+Print usage and exit.
+.SH SIGNALS
+.TP
+.BR SIGTERM , " " SIGINT , " " SIGHUP
+Shut down cleanly and remove the service-owned PTY link.
+.TP
+.B SIGUSR1
+Write current frame, byte, error, reconnect, and drop counters to the log.
+.SH FILES
+.TP
+.I /dev/i2c-N
+Linux I2C device selected by
+.IR i2cbus .
+.TP
+.I /run/lock/i2ckiss-*.lock
+Per-I2C-endpoint ownership locks.
+.TP
+.I /etc/i2ckiss/INSTANCE.conf
+Options read by the supplied systemd template.
+.TP
+.I /run/i2ckiss-INSTANCE/pty
+Service-lifetime link to the allocated PTY.
+.SH SEE ALSO
+.BR kissattach (8),
+.BR systemd.service (5),
+.BR tmpfiles.d (5)
+.SH AUTHOR
+Stephen Olesen.
+.SH LICENSE
+MIT License.

@@ -1,0 +1,9 @@
+/build/
+/dist/
+
+# Local compatibility-reference artifacts; never publish these files.
+/i2ckiss
+/i2ckiss.zip
+
+*.o
+*~

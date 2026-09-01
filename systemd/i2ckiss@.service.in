@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Stephen Olesen
+
+[Unit]
+Description=Reliable I2C KISS bridge (%i)
+Documentation=man:i2ckiss(8)
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=/etc/i2ckiss/%i.conf
+ExecStart=@SBINDIR@/i2ckiss --foreground --syslog --lock-dir /run/lock $I2CKISS_OPTIONS symlink /run/i2ckiss-%i/pty
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+RuntimeDirectory=i2ckiss-%i
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=no
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
