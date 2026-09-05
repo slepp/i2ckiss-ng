@@ -43,6 +43,67 @@ static void test_kiss_codec(void)
            DECODE_OVERSIZED);
 }
 
+static void test_decoder_boundaries(void)
+{
+    struct kiss_decoder decoder = { .checksum = true };
+    size_t length = 123;
+
+    assert(decoder_feed(&decoder, KISS_FEND, &length) == DECODE_NONE);
+    assert(length == 0);
+    assert(decoder_feed(&decoder, 0, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, KISS_FEND, &length) == DECODE_MALFORMED);
+    assert(length == 0);
+    assert(decoder_feed(&decoder, KISS_FESC, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, KISS_FEND, &length) == DECODE_MALFORMED);
+
+    /* A valid command-only frame still works after rejected frames. */
+    assert(decoder_feed(&decoder, 0, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, 0, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, KISS_FEND, &length) == DECODE_FRAME);
+    assert(length == 1 && decoder.data[0] == 0);
+
+    decoder.checksum = false;
+    for (size_t i = 0; i < MAX_KISS_FRAME; ++i)
+        assert(decoder_feed(&decoder, 1, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, KISS_FEND, &length) == DECODE_FRAME);
+    assert(length == MAX_KISS_FRAME);
+
+    /* An invalid escape reports an error but retains preceding bytes. */
+    assert(decoder_feed(&decoder, 0, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, KISS_FESC, &length) == DECODE_NONE);
+    assert(decoder_feed(&decoder, 1, &length) == DECODE_MALFORMED);
+    assert(decoder_feed(&decoder, KISS_FEND, &length) == DECODE_FRAME);
+    assert(length == 1 && decoder.data[0] == 0);
+}
+
+static void test_pty_receive_queues_wire_frame(void)
+{
+    struct app app = {0};
+    static const uint8_t input[] = { KISS_FEND, 0x70, KISS_FESC };
+    static const uint8_t rest[] = { KISS_TFEND, KISS_FEND };
+    static const uint8_t expected[] = {
+        KISS_FEND, 0, KISS_FESC, KISS_TFEND,
+        KISS_FESC, KISS_TFEND, KISS_FEND
+    };
+    struct pollfd descriptor;
+
+    assert(pty_pair_open(&app.pty) == 0);
+    descriptor = (struct pollfd){ .fd = app.pty.master_fd, .events = POLLIN };
+    assert(service_pty_receive(&app) == 0);
+    assert(write(app.pty.guard_fd, input, sizeof(input)) == (ssize_t)sizeof(input));
+    assert(poll(&descriptor, 1, 1000) == 1);
+    assert(service_pty_receive(&app) == 0);
+    assert(app.tx_head == NULL);
+    assert(write(app.pty.guard_fd, rest, sizeof(rest)) == (ssize_t)sizeof(rest));
+    assert(poll(&descriptor, 1, 1000) == 1);
+    assert(service_pty_receive(&app) == 0);
+    assert(app.tx_head != NULL && app.tx_head == app.tx_tail);
+    assert(app.tx_head->len == sizeof(expected));
+    assert(memcmp(app.tx_head->data, expected, sizeof(expected)) == 0);
+    free_tx_queue(&app);
+    pty_pair_close(&app.pty);
+}
+
 static void test_i2c_queue_is_bounded(void)
 {
     struct app app;
@@ -162,6 +223,8 @@ static void test_instance_lock(void)
 int main(void)
 {
     test_kiss_codec();
+    test_decoder_boundaries();
+    test_pty_receive_queues_wire_frame();
     test_i2c_queue_is_bounded();
     test_pty_is_unique_and_usable();
     test_symlink_collision_rules();

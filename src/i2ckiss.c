@@ -276,6 +276,30 @@ static void decoder_reset(struct kiss_decoder *decoder)
     decoder->overflow = false;
 }
 
+static enum decode_result decoder_finish(const struct kiss_decoder *decoder,
+                                         size_t *frame_length)
+{
+    if (decoder->overflow)
+        return DECODE_OVERSIZED;
+    if (decoder->escaped)
+        return DECODE_MALFORMED;
+    if (decoder->len == 0)
+        return DECODE_NONE;
+
+    if (decoder->checksum) {
+        uint8_t checksum = 0;
+
+        if (decoder->len < 2)
+            return DECODE_MALFORMED;
+        for (size_t i = 0; i < decoder->len; ++i)
+            checksum ^= decoder->data[i];
+        if (checksum != 0)
+            return DECODE_BAD_CHECKSUM;
+    }
+    *frame_length = decoder->len - (decoder->checksum ? 1U : 0U);
+    return DECODE_FRAME;
+}
+
 static enum decode_result decoder_feed(struct kiss_decoder *decoder,
                                        uint8_t byte, size_t *frame_length)
 {
@@ -283,34 +307,8 @@ static enum decode_result decoder_feed(struct kiss_decoder *decoder,
 
     *frame_length = 0;
     if (byte == KISS_FEND) {
-        enum decode_result result = DECODE_NONE;
+        enum decode_result result = decoder_finish(decoder, frame_length);
 
-        if (decoder->overflow) {
-            result = DECODE_OVERSIZED;
-        } else if (decoder->escaped) {
-            result = DECODE_MALFORMED;
-        } else if (decoder->len > 0) {
-            if (decoder->checksum) {
-                uint8_t checksum = 0;
-                size_t i;
-
-                if (decoder->len < 2) {
-                    result = DECODE_MALFORMED;
-                } else {
-                    for (i = 0; i < decoder->len; ++i)
-                        checksum ^= decoder->data[i];
-                    if (checksum != 0) {
-                        result = DECODE_BAD_CHECKSUM;
-                    } else {
-                        *frame_length = decoder->len - 1;
-                        result = DECODE_FRAME;
-                    }
-                }
-            } else {
-                *frame_length = decoder->len;
-                result = DECODE_FRAME;
-            }
-        }
         decoder_reset(decoder);
         return result;
     }
@@ -990,15 +988,33 @@ static int event_timeout(const struct app *app, int64_t now)
         deadline = app->child_restart_at;
     if (deadline <= now)
         return 0;
-    if (deadline - now > 1000)
-        return 1000;
     return (int)(deadline - now);
+}
+
+static int service_pty_receive(struct app *app)
+{
+    uint8_t input[READ_CHUNK];
+
+    for (;;) {
+        ssize_t count = read(app->pty.master_fd, input, sizeof(input));
+
+        if (count > 0) {
+            consume_pty_bytes(app, input, (size_t)count);
+            continue;
+        }
+        if (count == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EIO)
+            return 0;
+        log_message(LOG_ERR, "PTY read failed: %s", strerror(errno));
+        return -1;
+    }
 }
 
 static int run_event_loop(struct app *app)
 {
-    uint8_t input[READ_CHUNK];
-
     while (!stop_requested) {
         struct pollfd descriptor;
         int64_t now = monotonic_ms();
@@ -1049,24 +1065,8 @@ static int run_event_loop(struct app *app)
                 return -1;
             }
         }
-        if (descriptor.revents & POLLIN) {
-            for (;;) {
-                ssize_t count = read(app->pty.master_fd, input, sizeof(input));
-                if (count > 0) {
-                    consume_pty_bytes(app, input, (size_t)count);
-                    continue;
-                }
-                if (count < 0 && errno == EINTR)
-                    continue;
-                if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                                  errno == EIO))
-                    break;
-                if (count == 0)
-                    break;
-                log_message(LOG_ERR, "PTY read failed: %s", strerror(errno));
-                return -1;
-            }
-        }
+        if ((descriptor.revents & POLLIN) && service_pty_receive(app) < 0)
+            return -1;
         if (descriptor.revents & POLLNVAL) {
             log_message(LOG_ERR, "PTY descriptor became invalid");
             return -1;
