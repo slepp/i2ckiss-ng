@@ -19,7 +19,7 @@ static void test_kiss_codec(void)
 
     memset(&decoder, 0, sizeof(decoder));
     decoder.checksum = true;
-    encoded_length = kiss_encode(frame, sizeof(frame), 0, true, encoded);
+    encoded_length = kiss_encode(frame, sizeof(frame), true, encoded);
     for (i = 0; i < encoded_length; ++i) {
         result = decoder_feed(&decoder, encoded[i], &frame_length);
         if (result == DECODE_FRAME)
@@ -197,6 +197,21 @@ static void test_symlink_collision_rules(void)
     assert(rmdir(directory) == 0);
 }
 
+static void test_retry_backoff(void)
+{
+    static const int expected[] = { 20, 40, 80, 160, 320, 640, 1001, 1001 };
+    int delay = 10;
+
+    for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+        delay = next_backoff(delay, 1001);
+        assert(delay == expected[i]);
+    }
+    assert(next_backoff(500, 1001) == 1000);
+    assert(next_backoff(501, 1001) == 1001);
+    assert(next_backoff(250, 250) == 250);
+    assert(next_backoff(1800000, 3600000) == 3600000);
+}
+
 static void test_instance_lock(void)
 {
     struct app first;
@@ -229,6 +244,7 @@ int main(void)
     test_pty_is_unique_and_usable();
     test_symlink_collision_rules();
     test_instance_lock();
+    test_retry_backoff();
     puts("all tests passed");
     return 0;
 }
