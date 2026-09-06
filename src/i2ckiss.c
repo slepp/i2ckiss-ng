@@ -60,8 +60,6 @@ struct config {
     int byte_delay_us;
     int retry_min_ms;
     int retry_max_ms;
-    int i2c_timeout;
-    int i2c_retries;
     int reset_delay_ms;
     int mtu;
     int diagnostics;
@@ -161,21 +159,7 @@ static int64_t monotonic_ms(void)
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static void sleep_ms(int milliseconds)
-{
-    struct timespec requested;
-
-    if (milliseconds <= 0)
-        return;
-    requested.tv_sec = milliseconds / 1000;
-    requested.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
-    while (nanosleep(&requested, &requested) < 0 && errno == EINTR) {
-        if (stop_requested)
-            break;
-    }
-}
-
-static void sleep_us(int microseconds)
+static void sleep_us(int64_t microseconds)
 {
     struct timespec requested;
 
@@ -187,6 +171,16 @@ static void sleep_us(int microseconds)
         if (stop_requested)
             break;
     }
+}
+
+static void sleep_ms(int milliseconds)
+{
+    sleep_us((int64_t)milliseconds * 1000);
+}
+
+static int next_backoff(int current, int maximum)
+{
+    return current > maximum / 2 ? maximum : current * 2;
 }
 
 static void log_message(int priority, const char *format, ...)
@@ -276,6 +270,30 @@ static void decoder_reset(struct kiss_decoder *decoder)
     decoder->overflow = false;
 }
 
+static enum decode_result decoder_finish(const struct kiss_decoder *decoder,
+                                         size_t *frame_length)
+{
+    if (decoder->overflow)
+        return DECODE_OVERSIZED;
+    if (decoder->escaped)
+        return DECODE_MALFORMED;
+    if (decoder->len == 0)
+        return DECODE_NONE;
+
+    if (decoder->checksum) {
+        uint8_t checksum = 0;
+
+        if (decoder->len < 2)
+            return DECODE_MALFORMED;
+        for (size_t i = 0; i < decoder->len; ++i)
+            checksum ^= decoder->data[i];
+        if (checksum != 0)
+            return DECODE_BAD_CHECKSUM;
+    }
+    *frame_length = decoder->len - (decoder->checksum ? 1U : 0U);
+    return DECODE_FRAME;
+}
+
 static enum decode_result decoder_feed(struct kiss_decoder *decoder,
                                        uint8_t byte, size_t *frame_length)
 {
@@ -283,34 +301,8 @@ static enum decode_result decoder_feed(struct kiss_decoder *decoder,
 
     *frame_length = 0;
     if (byte == KISS_FEND) {
-        enum decode_result result = DECODE_NONE;
+        enum decode_result result = decoder_finish(decoder, frame_length);
 
-        if (decoder->overflow) {
-            result = DECODE_OVERSIZED;
-        } else if (decoder->escaped) {
-            result = DECODE_MALFORMED;
-        } else if (decoder->len > 0) {
-            if (decoder->checksum) {
-                uint8_t checksum = 0;
-                size_t i;
-
-                if (decoder->len < 2) {
-                    result = DECODE_MALFORMED;
-                } else {
-                    for (i = 0; i < decoder->len; ++i)
-                        checksum ^= decoder->data[i];
-                    if (checksum != 0) {
-                        result = DECODE_BAD_CHECKSUM;
-                    } else {
-                        *frame_length = decoder->len - 1;
-                        result = DECODE_FRAME;
-                    }
-                }
-            } else {
-                *frame_length = decoder->len;
-                result = DECODE_FRAME;
-            }
-        }
         decoder_reset(decoder);
         return result;
     }
@@ -354,7 +346,7 @@ static size_t append_escaped(uint8_t *output, size_t offset, uint8_t byte)
 }
 
 static size_t kiss_encode(const uint8_t *frame, size_t frame_length,
-                          unsigned int port, bool checksum, uint8_t *output)
+                          bool checksum, uint8_t *output)
 {
     uint8_t sum = 0;
     uint8_t command;
@@ -363,7 +355,8 @@ static size_t kiss_encode(const uint8_t *frame, size_t frame_length,
 
     if (frame_length == 0)
         return 0;
-    command = (uint8_t)((frame[0] & 0x0fU) | ((port & 0x0fU) << 4));
+    /* This bridge always uses KISS port zero. */
+    command = frame[0] & 0x0fU;
     output[offset++] = KISS_FEND;
     offset = append_escaped(output, offset, command);
     sum ^= command;
@@ -434,7 +427,7 @@ static int enqueue_i2c_frame(struct app *app, const uint8_t *frame,
         return -1;
     queued->next = NULL;
     queued->pos = 0;
-    queued->len = kiss_encode(frame, frame_length, 0, true, queued->data);
+    queued->len = kiss_encode(frame, frame_length, true, queued->data);
     if (app->tx_tail != NULL)
         app->tx_tail->next = queued;
     else
@@ -453,6 +446,16 @@ static void free_tx_queue(struct app *app)
     }
     app->tx_tail = NULL;
     app->tx_queued_bytes = 0;
+}
+
+static void pty_pair_close(struct pty_pair *pair)
+{
+    if (pair->guard_fd >= 0)
+        close(pair->guard_fd);
+    if (pair->master_fd >= 0)
+        close(pair->master_fd);
+    pair->guard_fd = -1;
+    pair->master_fd = -1;
 }
 
 static int pty_pair_open(struct pty_pair *pair)
@@ -485,25 +488,10 @@ static int pty_pair_open(struct pty_pair *pair)
 fail:
     {
         int saved_errno = errno;
-        if (pair->guard_fd >= 0)
-            close(pair->guard_fd);
-        if (pair->master_fd >= 0)
-            close(pair->master_fd);
-        pair->guard_fd = -1;
-        pair->master_fd = -1;
+        pty_pair_close(pair);
         errno = saved_errno;
         return -1;
     }
-}
-
-static void pty_pair_close(struct pty_pair *pair)
-{
-    if (pair->guard_fd >= 0)
-        close(pair->guard_fd);
-    if (pair->master_fd >= 0)
-        close(pair->master_fd);
-    pair->guard_fd = -1;
-    pair->master_fd = -1;
 }
 
 static bool pts_target(const char *target)
@@ -655,14 +643,14 @@ static int acquire_instance_lock(struct app *app)
     return 0;
 }
 
-static int smbus_access(int fd, __u8 read_write, uint8_t command, __u32 size,
+static int smbus_access(int fd, __u8 read_write, uint8_t command,
                         union i2c_smbus_data *data)
 {
     struct i2c_smbus_ioctl_data request;
 
     request.read_write = read_write;
     request.command = command;
-    request.size = size;
+    request.size = I2C_SMBUS_BYTE;
     request.data = data;
     return ioctl(fd, I2C_SMBUS, &request);
 }
@@ -671,14 +659,14 @@ static int smbus_read_byte(int fd)
 {
     union i2c_smbus_data data;
 
-    if (smbus_access(fd, I2C_SMBUS_READ, 0, I2C_SMBUS_BYTE, &data) < 0)
+    if (smbus_access(fd, I2C_SMBUS_READ, 0, &data) < 0)
         return -1;
     return data.byte & 0xff;
 }
 
 static int smbus_write_byte(int fd, uint8_t value)
 {
-    return smbus_access(fd, I2C_SMBUS_WRITE, value, I2C_SMBUS_BYTE, NULL);
+    return smbus_access(fd, I2C_SMBUS_WRITE, value, NULL);
 }
 
 static void schedule_reconnect(struct app *app, const char *reason)
@@ -697,11 +685,8 @@ static void schedule_reconnect(struct app *app, const char *reason)
     log_message(LOG_WARNING, "%s: %s; retrying in %d ms", reason,
                 strerror(saved_errno), app->reconnect_backoff_ms);
     notify_systemd("STATUS=I2C unavailable; retrying\n");
-    if (app->reconnect_backoff_ms < app->cfg.retry_max_ms) {
-        app->reconnect_backoff_ms *= 2;
-        if (app->reconnect_backoff_ms > app->cfg.retry_max_ms)
-            app->reconnect_backoff_ms = app->cfg.retry_max_ms;
-    }
+    app->reconnect_backoff_ms = next_backoff(app->reconnect_backoff_ms,
+                                            app->cfg.retry_max_ms);
 }
 
 static int reset_tnc(struct app *app)
@@ -730,12 +715,11 @@ static int connect_i2c(struct app *app)
         return -1;
     if (ioctl(fd, I2C_SLAVE, app->cfg.address) < 0)
         goto fail;
-    if (app->cfg.i2c_timeout > 0 &&
-        ioctl(fd, I2C_TIMEOUT, app->cfg.i2c_timeout) < 0 &&
+    /* Linux expresses the adapter timeout in units of 10 ms. */
+    if (ioctl(fd, I2C_TIMEOUT, 100) < 0 &&
         errno != ENOTTY && errno != EINVAL)
         goto fail;
-    if (app->cfg.i2c_retries >= 0 &&
-        ioctl(fd, I2C_RETRIES, app->cfg.i2c_retries) < 0 &&
+    if (ioctl(fd, I2C_RETRIES, 3) < 0 &&
         errno != ENOTTY && errno != EINVAL)
         goto fail;
     probe = smbus_read_byte(fd);
@@ -808,7 +792,7 @@ static int queue_frame_for_pty(struct app *app, const uint8_t *frame,
                                size_t frame_length)
 {
     uint8_t encoded[MAX_KISS_FRAME * 2 + 4];
-    size_t encoded_length = kiss_encode(frame, frame_length, 0, false, encoded);
+    size_t encoded_length = kiss_encode(frame, frame_length, false, encoded);
 
     if (byte_queue_push(&app->pty_output, encoded, encoded_length) < 0) {
         app->stats.dropped_frames++;
@@ -969,11 +953,8 @@ static void reap_children(struct app *app)
             log_message(LOG_WARNING,
                         "kissattach was killed by signal %d; restarting in %d ms",
                         WTERMSIG(status), app->child_backoff_ms);
-        if (app->child_backoff_ms < app->cfg.retry_max_ms) {
-            app->child_backoff_ms *= 2;
-            if (app->child_backoff_ms > app->cfg.retry_max_ms)
-                app->child_backoff_ms = app->cfg.retry_max_ms;
-        }
+        app->child_backoff_ms = next_backoff(app->child_backoff_ms,
+                                            app->cfg.retry_max_ms);
     }
 }
 
@@ -990,15 +971,33 @@ static int event_timeout(const struct app *app, int64_t now)
         deadline = app->child_restart_at;
     if (deadline <= now)
         return 0;
-    if (deadline - now > 1000)
-        return 1000;
     return (int)(deadline - now);
+}
+
+static int service_pty_receive(struct app *app)
+{
+    uint8_t input[READ_CHUNK];
+
+    for (;;) {
+        ssize_t count = read(app->pty.master_fd, input, sizeof(input));
+
+        if (count > 0) {
+            consume_pty_bytes(app, input, (size_t)count);
+            continue;
+        }
+        if (count == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EIO)
+            return 0;
+        log_message(LOG_ERR, "PTY read failed: %s", strerror(errno));
+        return -1;
+    }
 }
 
 static int run_event_loop(struct app *app)
 {
-    uint8_t input[READ_CHUNK];
-
     while (!stop_requested) {
         struct pollfd descriptor;
         int64_t now = monotonic_ms();
@@ -1049,24 +1048,8 @@ static int run_event_loop(struct app *app)
                 return -1;
             }
         }
-        if (descriptor.revents & POLLIN) {
-            for (;;) {
-                ssize_t count = read(app->pty.master_fd, input, sizeof(input));
-                if (count > 0) {
-                    consume_pty_bytes(app, input, (size_t)count);
-                    continue;
-                }
-                if (count < 0 && errno == EINTR)
-                    continue;
-                if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                                  errno == EIO))
-                    break;
-                if (count == 0)
-                    break;
-                log_message(LOG_ERR, "PTY read failed: %s", strerror(errno));
-                return -1;
-            }
-        }
+        if ((descriptor.revents & POLLIN) && service_pty_receive(app) < 0)
+            return -1;
         if (descriptor.revents & POLLNVAL) {
             log_message(LOG_ERR, "PTY descriptor became invalid");
             return -1;
@@ -1221,8 +1204,6 @@ static int parse_arguments(int argc, char **argv, struct config *cfg)
     cfg->byte_delay_us = 1000;
     cfg->retry_min_ms = 250;
     cfg->retry_max_ms = 30000;
-    cfg->i2c_timeout = 100;
-    cfg->i2c_retries = 3;
     cfg->reset_delay_ms = 2000;
     cfg->reset_tnc = true;
     cfg->lock_dir = "/run/lock";

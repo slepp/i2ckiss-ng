@@ -18,6 +18,13 @@ jobs:
 
       - name: Install build tools
         run: |
+          # Keep Bullseye builds independent of packages removed from live mirrors.
+          # Snapshot metadata expires; APT still verifies repository signatures.
+          printf '%s\n' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260831T000000Z bullseye main' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/20260831T000000Z bullseye-security main' \
+            'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260831T000000Z bullseye-updates main' \
+            > /etc/apt/sources.list
           apt-get update
           apt-get install --yes --no-install-recommends build-essential dpkg-dev gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
 
